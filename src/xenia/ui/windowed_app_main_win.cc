@@ -13,7 +13,8 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/main_win.h"
 #include "xenia/base/platform_win.h"
-#include "xenia/kernel/kernel_state.cc"
+#include "xenia/emulator.h"
+#include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/windowed_app.h"
 #include "xenia/ui/windowed_app_context_win.h"
 
@@ -191,13 +192,14 @@ static bool exception_pointers_handler(HostExceptionReport* report) {
 
   std::string title_info = "Title not started yet.";
 
-  if (xe::kernel::kernel_state()) {
-    if (xe::kernel::kernel_state()->emulator()->is_title_open()) {
-      const uint32_t title_id = xe::kernel::kernel_state()->title_id();
+  auto* kernel_state = xe::kernel::KernelState::shared();
+  if (kernel_state) {
+    if (kernel_state->emulator()->is_title_open()) {
+      const uint32_t title_id = kernel_state->title_id();
       const std::string title_name =
-          xe::kernel::kernel_state()->emulator()->title_name();
+          kernel_state->emulator()->title_name();
       const std::string title_version =
-          xe::kernel::kernel_state()->emulator()->title_version();
+          kernel_state->emulator()->title_version();
 
       title_info =
           fmt::format("{} ({:08X}) - {}", title_name, title_id, title_version);

@@ -169,6 +169,8 @@ class Emulator {
   // This is effectively the guest operating system.
   kernel::KernelState* kernel_state() const { return kernel_state_.get(); }
 
+  void InstallNuiSkeletonInjector();
+
   patcher::Patcher* patcher() const { return patcher_.get(); }
 
   patcher::PluginLoader* plugin_loader() const { return plugin_loader_.get(); }

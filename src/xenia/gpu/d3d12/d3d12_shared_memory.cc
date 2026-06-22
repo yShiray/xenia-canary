@@ -344,9 +344,47 @@ bool D3D12SharedMemory::UploadRanges(
 
       if (start_access == xe::memory::PageAccess::kNoAccess ||
           end_access == xe::memory::PageAccess::kNoAccess) {
-        XELOGE("Invalid upload range for GPU: {:08X} length {:08X}",
-               upload_range_start, upload_range_length);
-        return false;
+        // Kinect titles (e.g. Dance Central 3) point a depth-camera texture at a
+        // physical large page that the NUI driver DMA-fills on real hardware.
+        // The emulator never reserves that page, so it reads as unmapped here.
+        // Detect that surface by its size (320x240 16-bit padded to 384 px wide,
+        // ~0x2D000 bytes), back it, and register it so the NUI runtime can fill
+        // it with the real Kinect depth each frame. Without this the title hangs
+        // on the Kinect sign-in / identity screen waiting for a valid depth feed.
+        const uint32_t length_bytes = upload_range_length << page_size_log2();
+        bool backed = false;
+        // The depth surface is 320x240 16-bit padded to 384 px wide (~0x2D000);
+        // the colour (camera) surface is 640x480 packed 16-bit YUV (0x96000).
+        // Both are NUI textures the title points a fetch at, which the driver
+        // would DMA-fill on hardware, so the page reads as unmapped here. Back
+        // the page and register it for the matching NUI runtime fill (otherwise
+        // the depth silhouette / colour camera stays black).
+        const bool is_depth_size =
+            length_bytes >= 0x2C000 && length_bytes <= 0x2F000;
+        const bool is_color_size =
+            length_bytes >= 0x95000 && length_bytes <= 0x97000;
+        if ((is_depth_size || is_color_size) &&
+            memory().GetPhysicalHeap()->AllocFixed(
+                range_start_addr, length_bytes, 1u << page_size_log2(),
+                xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
+                xe::kMemoryProtectRead | xe::kMemoryProtectWrite)) {
+          if (is_depth_size) {
+            memory().SetNuiTitleDepthSurface(range_start_addr, length_bytes);
+          } else {
+            memory().SetNuiTitleColorSurface(range_start_addr, length_bytes);
+          }
+          XELOGW(
+              "NUI {} surface backed + registered for runtime fill: {:08X} "
+              "length {:08X}",
+              is_depth_size ? "depth" : "color", range_start_addr,
+              length_bytes);
+          backed = true;
+        }
+        if (!backed) {
+          XELOGE("Invalid upload range for GPU: {:08X} length {:08X}",
+                 upload_range_start, upload_range_length);
+          return false;
+        }
       }
     }
 

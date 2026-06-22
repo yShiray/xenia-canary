@@ -7,6 +7,9 @@
  ******************************************************************************
  */
 
+#include <atomic>
+#include <cstring>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
@@ -157,14 +160,23 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
       // though were are completing immediately.
       // Low bit probably means do not queue to IO ports.
       if ((uint32_t)apc_routine_ptr & ~1) {
-        if (apc_context && result == X_STATUS_SUCCESS) {
+        // Enqueue the APC whenever the caller provided a context, regardless of
+        // the read result. Requiring SUCCESS here dropped the completion APC for
+        // reads that hit END_OF_FILE (e.g. a title reading a whole compressed NUI
+        // database in one async request), so the title's async-read continuation
+        // never ran and it skipped the LDIDecompress step. Matches the older
+        // working behaviour.
+        if (apc_context) {
           auto thread = XThread::GetCurrentThread();
           thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
                              apc_context, io_status_block, 0);
         }
       }
 
-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
+      if (!file->is_synchronous()) {
+        // An async (non-synchronous) file must report PENDING even when the read
+        // completed here (the event is signalled below). Suppressing PENDING on
+        // END_OF_FILE broke titles that wait on the overlapped completion.
         result = X_STATUS_PENDING;
       }
 
@@ -478,13 +490,14 @@ dword_result_t NtQueryFullAttributesFile_entry(
       kernel_memory()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
 
   object_ref<XFile> root_file;
+  vfs::Entry* root_entry = nullptr;
   if (obj_attribs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
       obj_attribs->root_directory != 0) {
     root_file = kernel_state()->object_table()->LookupObject<XFile>(
         obj_attribs->root_directory);
     assert_not_null(root_file);
     assert_true(root_file->type() == XObject::Type::File);
-    assert_always();
+    root_entry = root_file->entry();
   }
 
   auto target_path = util::TranslateAnsiPath(kernel_memory(), object_name);
@@ -494,8 +507,19 @@ dword_result_t NtQueryFullAttributesFile_entry(
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
-  // Resolve the file using the virtual file system.
-  auto entry = kernel_state()->file_system()->ResolvePath(target_path);
+  // Resolve the file. When the query is relative to an already-open directory
+  // handle (root_directory) and the name has no device prefix, resolve it
+  // against that root entry. The previous code asserted and then resolved the
+  // bare relative path absolutely, which fails for titles that query a file
+  // inside a mounted package by handle+name (e.g. JD2019 sizing its NUI
+  // databases before reading/decompressing them).
+  vfs::Entry* entry = nullptr;
+  if (root_entry && target_path.find(':') == std::string::npos) {
+    entry = target_path.empty() ? root_entry
+                                 : root_entry->ResolvePath(target_path);
+  } else {
+    entry = kernel_state()->file_system()->ResolvePath(target_path);
+  }
   if (entry) {
     // Found.
     file_info->creation_time = entry->create_timestamp();
@@ -650,7 +674,14 @@ dword_result_t NtDeviceIoControlFile_entry(
   // Called by XMountUtilityDrive cache-mounting code
   // (checks if the returned values look valid, values below seem to pass the
   // checks)
-  constexpr uint32_t cache_size = 0xFF000;
+  //
+  // Size of the emulated HDD title cache partition (\Device\Harddisk0\Cache*).
+  // JD2019 formats this partition as FATX for its Autodance video buffer and
+  // refuses Autodance (TRC_AUTODANCEREQUIRESHDD) if the cache is too small, so
+  // this must report a generous size (~512 MiB). MUST stay consistent with the
+  // volume size reported by NullDevice (total_allocation_units *
+  // sectors_per_allocation_unit * bytes_per_sector in null_device.h).
+  constexpr uint32_t cache_size = 0x20000000;  // 512 MiB
 
   if (io_control_code == X_IOCTL_DISK_GET_DRIVE_GEOMETRY) {
     if (output_buffer_len < 0x8) {
@@ -759,6 +790,123 @@ void IoDeleteDevice_entry(dword_t device_ptr, const ppc_context_t& ctx) {
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+// Device / IRP compatibility stubs. The Xbox 360 cache-mount path
+// (XMountUtilityDrive) builds an IRP via IoBuildDeviceIoControlRequest and calls
+// the driver, then dismounts. Leaving IoBuildDeviceIoControlRequest as an
+// undefined extern returned NULL (no IRP), so the cache mount failed and titles
+// that stage decompressed data through the cache (e.g. JD2019's NUI databases)
+// could not proceed. These mirror the older working behaviour.
+void LogIoCompatibilityCall(const char* name, uint32_t r3, uint32_t r4,
+                            uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8) {
+  static std::atomic<uint32_t> call_count{0};
+  const uint32_t call = call_count.fetch_add(1, std::memory_order_relaxed);
+  if (call < 128 || (call & 0x3FF) == 0) {
+    XELOGW(
+        "{} compatibility stub: r3={:08X}, r4={:08X}, r5={:08X}, r6={:08X}, "
+        "r7={:08X}, r8={:08X}",
+        name, r3, r4, r5, r6, r7, r8);
+  }
+}
+
+dword_result_t IoDismountVolume_entry(unknown_t device_object) {
+  LogIoCompatibilityCall("IoDismountVolume", uint32_t(device_object), 0, 0, 0, 0,
+                         0);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolume, kFileSystem, kStub);
+
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t file_handle) {
+  LogIoCompatibilityCall("IoDismountVolumeByFileHandle", uint32_t(file_handle),
+                         0, 0, 0, 0, 0);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
+
+dword_result_t IoDismountVolumeByName_entry(pointer_t<X_ANSI_STRING> name) {
+  LogIoCompatibilityCall("IoDismountVolumeByName", name.guest_address(), 0, 0, 0,
+                         0, 0);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByName, kFileSystem, kStub);
+
+dword_result_t IoBuildDeviceIoControlRequest_entry(
+    dword_t io_control_code, unknown_t device_object, lpvoid_t input_buffer,
+    dword_t input_buffer_len, lpvoid_t output_buffer, dword_t output_buffer_len,
+    dword_t internal_device_io_control, unknown_t event,
+    unknown_t io_status_block) {
+  LogIoCompatibilityCall(
+      "IoBuildDeviceIoControlRequest", uint32_t(io_control_code),
+      uint32_t(device_object), input_buffer.guest_address(),
+      uint32_t(input_buffer_len), output_buffer.guest_address(),
+      uint32_t(output_buffer_len));
+
+  if (output_buffer && output_buffer_len) {
+    std::memset(static_cast<uint8_t*>(output_buffer), 0, output_buffer_len);
+  }
+  if (io_status_block) {
+    auto status_block = kernel_memory()->TranslateVirtual<X_IO_STATUS_BLOCK*>(
+        uint32_t(io_status_block));
+    status_block->status = X_STATUS_SUCCESS;
+    status_block->information = uint32_t(output_buffer_len);
+  }
+
+  const uint32_t irp_guest = kernel_memory()->SystemHeapAlloc(0x80);
+  auto irp = kernel_memory()->TranslateVirtual<uint8_t*>(irp_guest);
+  std::memset(irp, 0, 0x80);
+  xe::store_and_swap<uint32_t>(irp + 0x00, uint32_t(io_control_code));
+  xe::store_and_swap<uint32_t>(irp + 0x04, uint32_t(device_object));
+  xe::store_and_swap<uint32_t>(irp + 0x08, input_buffer.guest_address());
+  xe::store_and_swap<uint32_t>(irp + 0x0C, uint32_t(input_buffer_len));
+  xe::store_and_swap<uint32_t>(irp + 0x10, output_buffer.guest_address());
+  xe::store_and_swap<uint32_t>(irp + 0x14, uint32_t(output_buffer_len));
+  xe::store_and_swap<uint32_t>(irp + 0x18, uint32_t(internal_device_io_control));
+  xe::store_and_swap<uint32_t>(irp + 0x1C, uint32_t(event));
+  xe::store_and_swap<uint32_t>(irp + 0x20, uint32_t(io_status_block));
+  return irp_guest;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoBuildDeviceIoControlRequest, kFileSystem, kStub);
+
+dword_result_t IoCallDriver_entry(unknown_t device_object, unknown_t irp) {
+  LogIoCompatibilityCall("IoCallDriver", uint32_t(device_object), uint32_t(irp),
+                         0, 0, 0, 0);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoCallDriver, kFileSystem, kStub);
+
+void IoCompleteRequest_entry(unknown_t irp, unknown_t priority_boost) {
+  LogIoCompatibilityCall("IoCompleteRequest", uint32_t(irp),
+                         uint32_t(priority_boost), 0, 0, 0, 0);
+}
+DECLARE_XBOXKRNL_EXPORT1(IoCompleteRequest, kFileSystem, kStub);
+
+dword_result_t IoInvalidDeviceRequest_entry(unknown_t device_object,
+                                            unknown_t irp, unknown_t r5,
+                                            unknown_t r6, unknown_t r7,
+                                            unknown_t r8) {
+  LogIoCompatibilityCall("IoInvalidDeviceRequest", uint32_t(device_object),
+                         uint32_t(irp), uint32_t(r5), uint32_t(r6), uint32_t(r7),
+                         uint32_t(r8));
+  return static_cast<X_STATUS>(0xC0000010u);  // STATUS_INVALID_DEVICE_REQUEST
+}
+DECLARE_XBOXKRNL_EXPORT1(IoInvalidDeviceRequest, kFileSystem, kStub);
+
+dword_result_t IoSynchronousDeviceIoControlRequest_entry(
+    dword_t io_control_code, unknown_t device_object, lpvoid_t input_buffer,
+    dword_t input_buffer_len, lpvoid_t output_buffer, dword_t output_buffer_len,
+    dword_t internal_device_io_control) {
+  LogIoCompatibilityCall(
+      "IoSynchronousDeviceIoControlRequest", uint32_t(io_control_code),
+      uint32_t(device_object), input_buffer.guest_address(),
+      uint32_t(input_buffer_len), output_buffer.guest_address(),
+      uint32_t(output_buffer_len));
+  if (output_buffer && output_buffer_len) {
+    std::memset(static_cast<uint8_t*>(output_buffer), 0, output_buffer_len);
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoSynchronousDeviceIoControlRequest, kFileSystem,
+                         kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

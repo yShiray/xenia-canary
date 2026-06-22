@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -542,6 +543,40 @@ class Memory {
   // Gets the physical base heap.
   VirtualHeap* GetPhysicalHeap();
 
+  // Registry for a title-managed NUI (Kinect) depth-camera surface. Some Kinect
+  // titles (e.g. Dance Central 3) point a GPU texture straight at a physical
+  // large page that the NUI driver would DMA-fill on real hardware. The emulator
+  // doesn't reserve that page, so the GPU sees it as unmapped. The shared-memory
+  // uploader detects it, backs it, and registers it here so the NUI runtime can
+  // fill it with the real Kinect depth each frame. Address is a physical guest
+  // address (as used by the GPU / TranslatePhysical).
+  void SetNuiTitleDepthSurface(uint32_t guest_physical_address, uint32_t size) {
+    nui_title_depth_surface_addr_.store(guest_physical_address,
+                                        std::memory_order_relaxed);
+    nui_title_depth_surface_size_.store(size, std::memory_order_relaxed);
+  }
+  uint32_t nui_title_depth_surface_addr() const {
+    return nui_title_depth_surface_addr_.load(std::memory_order_relaxed);
+  }
+  uint32_t nui_title_depth_surface_size() const {
+    return nui_title_depth_surface_size_.load(std::memory_order_relaxed);
+  }
+  // Same mechanism as the depth surface, for the NUI COLOR (camera) texture the
+  // title points its colour fetch at. The shared-memory uploader backs the
+  // unmapped physical page and registers it here so PublishColorToGuest fills it
+  // with the live Kinect colour each frame (otherwise the camera feed is black).
+  void SetNuiTitleColorSurface(uint32_t guest_physical_address, uint32_t size) {
+    nui_title_color_surface_addr_.store(guest_physical_address,
+                                        std::memory_order_relaxed);
+    nui_title_color_surface_size_.store(size, std::memory_order_relaxed);
+  }
+  uint32_t nui_title_color_surface_addr() const {
+    return nui_title_color_surface_addr_.load(std::memory_order_relaxed);
+  }
+  uint32_t nui_title_color_surface_size() const {
+    return nui_title_color_surface_size_.load(std::memory_order_relaxed);
+  }
+
   void GetHeapsPageStatsSummary(const BaseHeap* const* provided_heaps,
                                 size_t heaps_count, uint32_t& unreserved_pages,
                                 uint32_t& reserved_pages, uint32_t& used_pages,
@@ -574,6 +609,11 @@ class Memory {
   uint32_t system_allocation_granularity_ = 0;
   uint8_t* virtual_membase_ = nullptr;
   uint8_t* physical_membase_ = nullptr;
+
+  std::atomic<uint32_t> nui_title_depth_surface_addr_{0};
+  std::atomic<uint32_t> nui_title_depth_surface_size_{0};
+  std::atomic<uint32_t> nui_title_color_surface_addr_{0};
+  std::atomic<uint32_t> nui_title_color_surface_size_{0};
 
   xe::memory::FileMappingHandle mapping_ =
       xe::memory::kFileMappingHandleInvalid;

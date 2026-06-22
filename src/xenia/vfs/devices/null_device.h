@@ -35,8 +35,13 @@ class NullDevice : public Device {
   uint32_t attributes() const override { return 0; }
   uint32_t component_name_max_length() const override { return 40; }
 
-  uint32_t total_allocation_units() const override { return 0x10; }
-  uint32_t available_allocation_units() const override { return 0x10; }
+  // 0x2000 units * 0x80 sectors * 0x200 bytes = 512 MiB. The HDD title cache
+  // partition (\Device\Harddisk0\Cache*) is backed by this NullDevice; JD2019
+  // formats it as FATX for its Autodance video buffer and disables Autodance
+  // (TRC_AUTODANCEREQUIRESHDD) if it looks too small. MUST stay consistent with
+  // cache_size in NtDeviceIoControlFile (xboxkrnl_io.cc).
+  uint32_t total_allocation_units() const override { return 0x2000; }
+  uint32_t available_allocation_units() const override { return 0x2000; }
 
   // STFC/cache code seems to require the product of the next two to equal
   // 0x10000

@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <atomic>
+
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
@@ -22,6 +24,43 @@
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+void LogEtxCall(const char* name, uint32_t r3, uint32_t r4, uint32_t r5,
+                uint32_t r6, uint32_t r7, uint32_t r8) {
+  static std::atomic<uint32_t> call_count{0};
+  const uint32_t call = call_count.fetch_add(1, std::memory_order_relaxed);
+  if (call < 128) {
+    XELOGI("{}: r3={:08X}, r4={:08X}, r5={:08X}, r6={:08X}, r7={:08X}, "
+           "r8={:08X}, result={:08X}",
+           name, r3, r4, r5, r6, r7, r8, X_STATUS_SUCCESS);
+  }
+}
+
+#define XBOXKRNL_ETX_STUB(name)                                             \
+  dword_result_t name##_entry(unknown_t r3, unknown_t r4, unknown_t r5,      \
+                              unknown_t r6, unknown_t r7, unknown_t r8) {   \
+    LogEtxCall(#name, uint32_t(r3), uint32_t(r4), uint32_t(r5),             \
+               uint32_t(r6), uint32_t(r7), uint32_t(r8));                  \
+    return X_STATUS_SUCCESS;                                                \
+  }                                                                         \
+  DECLARE_XBOXKRNL_EXPORT2(name, kDebug, kStub, kHighFrequency)
+
+XBOXKRNL_ETX_STUB(EtxConsumerDisableEventType);
+XBOXKRNL_ETX_STUB(EtxConsumerEnableEventType);
+XBOXKRNL_ETX_STUB(EtxConsumerProcessLogs);
+XBOXKRNL_ETX_STUB(EtxConsumerRegister);
+XBOXKRNL_ETX_STUB(EtxConsumerUnregister);
+XBOXKRNL_ETX_STUB(EtxProducerLog);
+XBOXKRNL_ETX_STUB(EtxProducerLogV);
+XBOXKRNL_ETX_STUB(EtxProducerRegister);
+XBOXKRNL_ETX_STUB(EtxProducerUnregister);
+XBOXKRNL_ETX_STUB(EtxConsumerFlushBuffers);
+XBOXKRNL_ETX_STUB(EtxProducerLogXwpp);
+XBOXKRNL_ETX_STUB(EtxProducerLogXwppV);
+XBOXKRNL_ETX_STUB(EtxBufferRegister);
+XBOXKRNL_ETX_STUB(EtxBufferUnregister);
+
+#undef XBOXKRNL_ETX_STUB
 
 void DbgBreakPoint_entry() { xe::debugging::Break(); }
 DECLARE_XBOXKRNL_EXPORT2(DbgBreakPoint, kDebug, kStub, kImportant);

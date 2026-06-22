@@ -9,6 +9,9 @@
 
 #include "xenia/kernel/xam/apps/xam_app.h"
 
+#include <atomic>
+#include <cstring>
+
 #include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_content_device.h"
@@ -17,6 +20,12 @@
 /* Notes:
    - Messages ids that start with 0x00021xxx are UI calls
    - Messages ids that start with 0x00023xxx are used for the user profile
+   - Messages ids that start with 0x0002Axxx are used by the NUI identity /
+   session binding sequence (Dance Central issues 0x2A005-0x2A008 right after
+   XamNuiIdentityGetSessionId / between the 0x2C00C and 0x2C009 identity polls).
+   Leaving them unimplemented (X_E_FAIL) lets the title track + show pose
+   feedback but never establishes a scored player, so the dance score never
+   accumulates. Handled with the same NUI status response as the 0x2C family.
    - Messages ids that start with 0x0002Bxxx are used by the Kinect device
    usually for camera related functions
    - Messages ids that start with 0x0002Cxxx are used by the XamNuiIdentity
@@ -26,7 +35,69 @@
 namespace xe {
 namespace kernel {
 namespace xam {
+
+uint32_t GetNuiDeviceStatus();
+bool IsNuiReady();
+uint32_t GetNuiTrackedSkeletonCount();
+uint32_t GetNuiBestTrackingId();
+
 namespace apps {
+
+namespace {
+
+bool IsNuiCompatibilityMessage(uint32_t message) {
+  const uint32_t family = message & 0xFFFFF000u;
+  return family >= 0x0002A000u && family <= 0x0002E000u;
+}
+
+X_HRESULT DispatchNuiCompatibilityMessage(uint32_t app_id, uint32_t message,
+                                          uint32_t buffer_ptr,
+                                          uint32_t buffer_length,
+                                          void* buffer) {
+  const uint32_t status = xam::GetNuiDeviceStatus();
+  const bool ready = xam::IsNuiReady();
+  const uint32_t tracked_count = xam::GetNuiTrackedSkeletonCount();
+  const uint32_t tracking_id = xam::GetNuiBestTrackingId();
+
+  if (buffer && buffer_length) {
+    std::memset(buffer, 0, buffer_length);
+    auto* dwords = reinterpret_cast<xe::be<uint32_t>*>(buffer);
+    const uint32_t dword_count = buffer_length / sizeof(uint32_t);
+    const uint32_t connected = status || ready ? 1 : 0;
+    const bool tracked = connected && tracked_count != 0 && tracking_id != 0;
+    const uint32_t body_status = tracked ? 2 : connected;
+    if (dword_count > 0) {
+      dwords[0] = body_status;
+    }
+    if (dword_count > 1) {
+      dwords[1] = connected;
+    }
+    if (dword_count > 2) {
+      dwords[2] = body_status;
+    }
+    if (dword_count > 3) {
+      dwords[3] = connected;
+    }
+    if (dword_count > 4) {
+      dwords[4] = tracked ? tracking_id : 0;
+    }
+    if (dword_count > 5) {
+      dwords[5] = tracked ? tracked_count : 0;
+    }
+  }
+
+  static std::atomic<uint32_t> log_count{0};
+  const uint32_t slot = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (slot < 64 || (slot & (slot - 1)) == 0) {
+    XELOGI("XamApp NUI message app={:08X}, msg={:08X}, buffer={:08X}, "
+           "length={}, status={}, ready={}, tracked_count={}, tracking_id={}",
+           app_id, message, buffer_ptr, buffer_length, status, ready ? 1 : 0,
+           tracked_count, tracking_id);
+  }
+  return status || ready ? X_E_SUCCESS : X_E_FAIL;
+}
+
+}  // namespace
 
 XamApp::XamApp(KernelState* kernel_state) : App(kernel_state, 0xFE) {}
 
@@ -191,6 +262,12 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return is_pc_enabled ? X_E_ACCESS_DENIED : X_E_SUCCESS;
     }
   }
+
+  if (IsNuiCompatibilityMessage(message)) {
+    return DispatchNuiCompatibilityMessage(app_id(), message, buffer_ptr,
+                                           buffer_length, buffer);
+  }
+
   XELOGE(
       "Unimplemented XAM message app={:08X}, msg={:08X}, arg1={:08X}, "
       "arg2={:08X}",

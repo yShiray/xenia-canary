@@ -9,7 +9,10 @@
 
 #include "xenia/kernel/xobject.h"
 
+#include <atomic>
+
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -465,7 +468,23 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state,
       case 23:  // ProfileObject
       case 24:  // ThreadedDpcObject
       default:
-        assert_always();
+        // These dispatcher object types aren't modelled as native XObjects.
+        // Release builds already fall through here and return null - the caller
+        // (e.g. xeKeWaitForSingleObject) then treats the wait as abandoned and
+        // continues. Some titles legitimately KeInitialize/wait on in-memory
+        // timers (e.g. JD2019's NUI init at boot), so don't hard-assert in debug
+        // and crash; log once per type and return null to match release.
+        {
+          static std::atomic<uint64_t> logged_types{0};
+          const uint64_t bit = (as_type >= 0 && as_type < 64)
+                                   ? (uint64_t(1) << as_type)
+                                   : 0;
+          if (!bit || !(logged_types.fetch_or(bit) & bit)) {
+            XELOGW("GetNativeObject: unmodelled dispatcher type {}, returning "
+                   "null (wait will be treated as abandoned)",
+                   as_type);
+          }
+        }
         result = nullptr;
     }
     // Stash pointer in struct.

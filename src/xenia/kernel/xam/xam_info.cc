@@ -409,6 +409,19 @@ dword_result_t XamQueryLiveHiveW_entry(lpu16string_t name, lpvoid_t out_buf,
 }
 DECLARE_XAM_EXPORT1(XamQueryLiveHiveW, kNone, kStub);
 
+// ASCII Live-config-hive getter (ordinal 0x708). Declared in the export table
+// but had no implementation, so XexGetProcedureAddress(xam, 0x708) returned
+// "not found" -> Dance Central 3 (which dynamically resolves it during its
+// intro) got STATUS_DRIVER_ORDINAL_NOT_FOUND and terminated the title.
+// Implement it (so the dynamic resolution succeeds) reporting the value as
+// absent -> the title uses its built-in defaults. The Live hive isn't emulated.
+dword_result_t XamGetLiveHiveValueA_entry(lpstring_t name, lpvoid_t out_buf,
+                                          dword_t out_size,
+                                          dword_t type /* guess */) {
+  return X_ERROR_NOT_FOUND;
+}
+DECLARE_XAM_EXPORT1(XamGetLiveHiveValueA, kNone, kStub);
+
 // http://www.noxa.org/blog/2011/02/28/building-an-xbox-360-emulator-part-3-feasibilityos/
 // http://www.noxa.org/blog/2011/08/13/building-an-xbox-360-emulator-part-5-xex-files/
 dword_result_t RtlSleep_entry(dword_t dwMilliseconds, dword_t bAlertable) {

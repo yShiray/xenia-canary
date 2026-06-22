@@ -649,6 +649,9 @@ X_RESULT KernelState::FinishLoadingUserModule(
   emulator_->patcher()->ApplyPatchesForTitle(memory_, module->title_id(),
                                              module->hash());
   emulator_->on_patch_apply();
+  if (module->is_executable()) {
+    emulator_->InstallNuiSkeletonInjector();
+  }
   if (module->xex_module()) {
     module->xex_module()->Precompile();
   }

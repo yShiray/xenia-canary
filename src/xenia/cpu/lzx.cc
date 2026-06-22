@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
+#include <vector>
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
@@ -143,6 +145,157 @@ int lzx_decompress(const void* lzx_data, size_t lzx_len, void* dest,
   }
 
   return result_code;
+}
+
+// Streaming LZX decompressor (xboxkrnl LDI / XMemDecompress).
+//
+// The Xbox 360 XCompress "LZXNATIVE" format feeds a series of compressed blocks
+// (XCOMPRESS_BLOCK_HEADER_LZXNATIVE) through ONE decompression context. The
+// canonical XMemDecompress loop creates the context once and decompresses each
+// block with a separate call, never resetting the context between blocks. The
+// blocks are byte aligned in the file, but the LZX *coding* state PERSISTS
+// across them: a single LZX block (block_type + 24-bit block_length, with its
+// huffman trees) routinely spans several fed blocks (observed block_length =
+// 70394 for JD2019's database.gmsodf, ~2.5 of the title's 32KB blocks). So the
+// huffman trees, R0/R1/R2 LRU offsets, the once-per-stream intel-E8 header, the
+// current LZX block's remaining length and the sliding window all carry over.
+//
+// We therefore drive one persistent lzxd_stream with reset_interval = 0 and, at
+// each LDIDecompress, only REALIGN the bit reader to the new block's first byte
+// (each block starts byte aligned; the previous block's trailing padding bits
+// must be discarded). Everything else - huffman/R0R1R2/header_read/
+// block_remaining/window/window_posn/frame_posn - is left untouched. Input is
+// served from a queue drained by the mspack read callback; output is re-pointed
+// at the caller's buffer each call.
+struct lzx_block_decompressor {
+  mspack_system* sys = nullptr;
+  mspack_memory_file* out = nullptr;
+  lzxd_stream* lzxd = nullptr;
+  std::vector<uint8_t> in_queue;
+  size_t in_read_pos = 0;
+};
+
+// mspack read callback for the input side: drains the pending input queue.
+// The mspack_file* handed in is the lzx_block_decompressor itself.
+static int lzx_block_in_read(mspack_file* file, void* buffer, int chars) {
+  auto* d = reinterpret_cast<lzx_block_decompressor*>(file);
+  if (chars < 0) {
+    return -1;
+  }
+  size_t remaining = d->in_queue.size() - d->in_read_pos;
+  size_t n = std::min(static_cast<size_t>(chars), remaining);
+  if (n) {
+    std::memcpy(buffer, d->in_queue.data() + d->in_read_pos, n);
+    d->in_read_pos += n;
+  }
+  return static_cast<int>(n);
+}
+
+void* lzx_create_block_decompressor(uint32_t window_size,
+                                    uint32_t uncompressed_block_size) {
+  (void)uncompressed_block_size;
+  uint32_t window_bits;
+  if (!xe::bit_scan_forward(window_size, &window_bits)) {
+    return nullptr;
+  }
+  // Regular (non-delta) LZX windows are 15..21 bits (32KB..2MB).
+  window_bits = std::min<uint32_t>(std::max<uint32_t>(window_bits, 15), 21);
+
+  auto* d = new lzx_block_decompressor();
+  d->sys = mspack_memory_sys_create();
+  if (d->sys) {
+    // Input is served from the queue, not a fixed memory buffer.
+    d->sys->read = lzx_block_in_read;
+    // Output starts as an empty placeholder; re-pointed each block.
+    static uint8_t kEmpty[1] = {0};
+    d->out = mspack_memory_open(d->sys, kEmpty, 0);
+  }
+  if (d->sys && d->out) {
+    d->lzxd = lzxd_init(d->sys, reinterpret_cast<mspack_file*>(d),
+                        reinterpret_cast<mspack_file*>(d->out),
+                        static_cast<int>(window_bits), /*reset_interval=*/0,
+                        /*input_buffer_size=*/0x8000, /*output_length=*/0,
+                        /*is_delta=*/0);
+  }
+  if (!d->lzxd) {
+    lzx_free_block_decompressor(d);
+    return nullptr;
+  }
+  return d;
+}
+
+int lzx_decompress_block(void* handle, const void* src, size_t src_len,
+                         void* dst, size_t dst_capacity, size_t* out_produced) {
+  auto* d = reinterpret_cast<lzx_block_decompressor*>(handle);
+  if (out_produced) {
+    *out_produced = 0;
+  }
+  if (!d || !d->lzxd) {
+    return 1;
+  }
+
+  // Serve this block's compressed bytes from the queue.
+  d->in_queue.clear();
+  d->in_read_pos = 0;
+  if (src && src_len) {
+    const uint8_t* s = reinterpret_cast<const uint8_t*>(src);
+    d->in_queue.assign(s, s + src_len);
+  }
+
+  // Each XCOMPRESS block is byte aligned in the file, but the LZX *coding* state
+  // (huffman trees, R0/R1/R2, the once-per-stream intel-E8 header, the current
+  // LZX block's remaining length, and the window) PERSISTS across blocks - a
+  // single LZX block routinely spans several fed blocks. The canonical
+  // XMemDecompress loop never resets the context between blocks. So we ONLY
+  // realign the bit reader to this block's first byte (discard the previous
+  // block's byte-padding bits) and leave all coding state intact.
+  lzxd_stream* lzxd = d->lzxd;
+  lzxd->i_ptr = lzxd->i_end;
+  lzxd->bit_buffer = 0;
+  lzxd->bits_left = 0;
+  lzxd->input_end = 0;
+
+  // Point the output at the caller's destination buffer for this call.
+  d->out->buffer = dst;
+  d->out->buffer_size = static_cast<off_t>(dst_capacity);
+  d->out->offset = 0;
+
+  // Bound the stream length to exactly what this call requests. mspack derives
+  // end_frame as (offset + out_bytes)/32KB + 1, so without a length it tries to
+  // decode one extra 32KB look-ahead frame - reading input this block doesn't
+  // contain. Setting length makes the per-frame size clamp turn the look-ahead
+  // into a no-op and clamp a final partial frame to its real size.
+  lzxd->length = lzxd->offset + static_cast<off_t>(dst_capacity);
+
+  // Resync the frame counter with the actual output position. mspack's very
+  // first decompress over-iterates by one frame, and the clamped look-ahead
+  // no-op still does frame++ - so frame drifts one ahead of offset/32KB.
+  // Re-deriving frame from offset before each block keeps the loop bound
+  // correct.
+  lzxd->frame = static_cast<unsigned int>(lzxd->offset / LZX_FRAME_SIZE);
+
+  int rc = lzxd_decompress(lzxd, static_cast<off_t>(dst_capacity));
+  if (out_produced) {
+    *out_produced = static_cast<size_t>(d->out->offset);
+  }
+  return rc;
+}
+
+void lzx_free_block_decompressor(void* handle) {
+  auto* d = reinterpret_cast<lzx_block_decompressor*>(handle);
+  if (!d) {
+    return;
+  }
+  if (d->lzxd) {
+    lzxd_free(d->lzxd);
+  }
+  if (d->out) {
+    mspack_memory_close(d->out);
+  }
+  if (d->sys) {
+    mspack_memory_sys_destroy(d->sys);
+  }
+  delete d;
 }
 
 int lzxdelta_apply_patch(xe::xex2_delta_patch* patch, size_t patch_len,

@@ -7,6 +7,14 @@
  ******************************************************************************
  */
 
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <span>
+#include <vector>
+
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/string_util.h"
@@ -22,7 +30,10 @@
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
+#include "xenia/vfs/devices/xcontent_devices/stfs_container_device.h"
+#include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
 
 DEFINE_int32(
@@ -459,14 +470,174 @@ dword_result_t XamContentCreateInternal_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentCreateInternal, kContent, kImplemented);
 
+static bool IsStfsContainerFile(const std::filesystem::path& host_path) {
+  std::ifstream file(host_path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+  char magic[4] = {0};
+  file.read(magic, sizeof(magic));
+  if (file.gcount() != sizeof(magic)) {
+    return false;
+  }
+  // STFS package magics: console signed (CON ), retail signed (LIVE),
+  // and system signed (PIRS).
+  return std::memcmp(magic, "CON ", 4) == 0 ||
+         std::memcmp(magic, "LIVE", 4) == 0 ||
+         std::memcmp(magic, "PIRS", 4) == 0;
+}
+
+// When the content file is NOT host-backed (e.g. it lives inside a disc image),
+// it can't be opened by host path to be mounted as an STFS container. Read it
+// through the VFS and, if it is an STFS package (CON/LIVE/PIRS), copy it to a
+// temp host file so the host-path mount path below can use it. This is what lets
+// a DISC-based Kinect title (e.g. Dance Central 3 from an ISO) mount its NUI
+// skeleton database (Database.xmplr -> stexemplar:\database.gmsodf); host-folder
+// installs (like the Just Dance 2019 folder) mount the file directly.
+static std::filesystem::path ExtractStfsContainerToTempFile(vfs::Entry* entry) {
+  if (!entry) {
+    return {};
+  }
+  size_t size = entry->size();
+  if (size < 4) {
+    return {};
+  }
+  vfs::File* in_file = nullptr;
+  if (entry->Open(vfs::FileAccess::kFileReadData, &in_file) !=
+          X_STATUS_SUCCESS ||
+      !in_file) {
+    return {};
+  }
+  std::vector<uint8_t> data(size);
+  size_t bytes_read = 0;
+  X_STATUS st = in_file->ReadSync(std::span<uint8_t>(data.data(), data.size()),
+                                  0, &bytes_read);
+  in_file->Destroy();
+  if (st != X_STATUS_SUCCESS || bytes_read < 4) {
+    return {};
+  }
+  // STFS magic: 'CON ' / 'LIVE' / 'PIRS'.
+  if (!((data[0] == 'C' && data[1] == 'O' && data[2] == 'N' &&
+         data[3] == ' ') ||
+        (data[0] == 'L' && data[1] == 'I' && data[2] == 'V' &&
+         data[3] == 'E') ||
+        (data[0] == 'P' && data[1] == 'I' && data[2] == 'R' &&
+         data[3] == 'S'))) {
+    return {};
+  }
+  std::error_code ec;
+  std::filesystem::path dir =
+      std::filesystem::temp_directory_path(ec) / "xenia_nui_stfs";
+  std::filesystem::create_directories(dir, ec);
+  static std::atomic<uint32_t> ctr{0};
+  std::filesystem::path out_path =
+      dir / ("stfs_" + std::to_string(ctr.fetch_add(1)) + ".bin");
+  std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    return {};
+  }
+  out.write(reinterpret_cast<const char*>(data.data()), bytes_read);
+  out.close();
+  XELOGI(
+      "XamContentOpenFile: extracted disc-backed STFS container ({} bytes) to a "
+      "temp host file for mounting",
+      bytes_read);
+  return out_path;
+}
+
 dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  // Opens an existing on-disc/content file and maps it to root_name:.
+  // This is what JD2019's NuiInitialize uses to open the NUI databases
+  // (game:\Database.xmplr, NuiIdentity.bin.be, nuisp<locale>). Those files are
+  // STFS content packages (PIRS), and the title then reads the data files that
+  // live *inside* them (e.g. stexemplar:\database.gmsodf,
+  // nuispeech:\speech\en-us\l1033.ini). So we MOUNT the package as a device
+  // under root_name: rather than just symlinking the root to the package file;
+  // otherwise the inner reads fail and NuiInitialize bails before starting the
+  // NUI skeleton processor. The original Xenia stub always returned
+  // FILE_NOT_FOUND.
+  X_RESULT result = X_ERROR_FILE_NOT_FOUND;
+  uint32_t disposition = 0;  // 0 = not found / not opened.
+  uint32_t license_mask = 0;
+
+  std::string path_str = path ? std::string(path.value()) : std::string();
+  std::string root_str =
+      root_name ? std::string(root_name.value()) : std::string();
+
+  auto fs = kernel_state()->file_system();
+  if (fs && !path_str.empty()) {
+    auto entry = fs->ResolvePath(path_str);
+    if (entry) {
+      bool mapped = false;
+      std::string link_name = root_str.empty() ? std::string() : root_str + ":";
+
+      // If we've already mapped this root (the title re-opens), reuse it.
+      std::string existing_target;
+      if (!link_name.empty() &&
+          fs->FindSymbolicLink(link_name, existing_target)) {
+        mapped = true;
+      }
+
+      // Host-backed files mount directly by host path; disc-image (or other
+      // non-host) backed files are extracted to a temp host file first.
+      std::filesystem::path host_path;
+      if (auto* host_entry = dynamic_cast<vfs::HostPathEntry*>(entry)) {
+        host_path = host_entry->host_path();
+      } else {
+        host_path = ExtractStfsContainerToTempFile(entry);
+      }
+
+      if (!mapped && !link_name.empty() && !host_path.empty() &&
+          IsStfsContainerFile(host_path)) {
+        static std::atomic<uint32_t> mount_counter{0};
+        std::string mount_path =
+            "\\Device\\XamContent" + std::to_string(mount_counter++);
+        auto device =
+            std::make_unique<vfs::StfsContainerDevice>(mount_path, host_path);
+        if (device->Initialize() && fs->RegisterDevice(std::move(device)) &&
+            fs->RegisterSymbolicLink(link_name, mount_path)) {
+          mapped = true;
+          XELOGI("XamContentOpenFile mounted STFS '{}' as {} ({})", path_str,
+                 link_name, mount_path);
+        } else {
+          XELOGW("XamContentOpenFile failed to mount STFS '{}'", path_str);
+        }
+      }
+
+      // Fall back for non-package files: map the root straight to the file, in
+      // case the title reads it back through the supplied root. Harmless if
+      // unused (unique prefix, never shadows game:/update:).
+      if (!mapped && !link_name.empty()) {
+        fs->RegisterSymbolicLink(link_name, path_str);
+      }
+
+      disposition = 1;  // Existing file opened.
+      license_mask = cvars::license_mask ? cvars::license_mask : 0xFFFFFFFFu;
+      result = X_ERROR_SUCCESS;
+      XELOGI("XamContentOpenFile('{}', '{}') -> SUCCESS", root_str, path_str);
+    } else {
+      XELOGW("XamContentOpenFile('{}', '{}') -> file not found", root_str,
+             path_str);
+    }
+  }
+
+  if (disposition_ptr) {
+    *disposition_ptr = disposition;
+  }
+  if (license_mask_ptr) {
+    *license_mask_ptr = license_mask;
+  }
+
+  if (overlapped_ptr) {
+    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);
+    return X_ERROR_IO_PENDING;
+  }
+  return result;
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kImplemented);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {

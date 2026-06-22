@@ -8,7 +8,12 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
+
+#include <mutex>
+#include <unordered_map>
+
 #include "xenia/base/logging.h"
+#include "xenia/cpu/lzx.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -812,6 +817,128 @@ dword_result_t MmIsAddressValid_entry(dword_t address,
 }
 
 DECLARE_XBOXKRNL_EXPORT1(MmIsAddressValid, kMemory, kImplemented);
+
+// ---------------------------------------------------------------------------
+// LZX block decompression interface (LDI*).
+//
+// These xboxkrnl exports are the low-level block decompressor that
+// XMemDecompress is built on. The Xbox 360 File Compression Tool (xbcompress)
+// produces a file header (XCOMPRESS_FILE_HEADER_LZXNATIVE) followed by a series
+// of XCOMPRESS_BLOCK_HEADER_LZXNATIVE blocks; the title parses that container
+// itself and feeds each compressed block here, reusing one context so the LZX
+// window persists across blocks.
+//
+// JD2019's NuiInitialize uses these to decompress the on-disc NUI databases
+// (game:\Database.xmplr -> database.gmsodf, NuiIdentity.bin.be, nuisp<locale>).
+// They were unimplemented (undefined extern), so NuiInitialize bailed before
+// starting the NUI skeleton processor. Backed by Xenia's mspack LZX decoder.
+namespace {
+struct LdiContext {
+  void* lzx = nullptr;  // lzx_create_block_decompressor handle.
+};
+std::mutex ldi_mutex;
+std::unordered_map<uint32_t, LdiContext*> ldi_contexts;
+uint32_t ldi_next_handle = 1;
+}  // namespace
+
+// int LDICreateDecompression(uint* pcbDataBlockMax, void* pvConfig,
+//                            PFNALLOC, PFNFREE, void* pvReserved,
+//                            uint* pcbSrcBufferMin, void** ppvContext);
+// ABI reversed from the title's call sites (r3..r9). Returns 0 on success.
+dword_result_t LDICreateDecompression_entry(
+    lpdword_t pcb_data_block_max, lpdword_t pv_configuration,
+    lpvoid_t pfn_alloc, lpvoid_t pfn_free, lpvoid_t pv_reserved,
+    lpdword_t pcb_src_buffer_min, lpdword_t ppv_context) {
+  uint32_t block_max =
+      pcb_data_block_max ? static_cast<uint32_t>(*pcb_data_block_max) : 0x8000;
+  if (block_max == 0) {
+    block_max = 0x8000;
+  }
+  // pvConfig[0] holds the LZX window size (e.g. 0x8000 / 0x80000).
+  uint32_t window_size =
+      pv_configuration ? static_cast<uint32_t>(pv_configuration[0]) : 0;
+  if (window_size < block_max) {
+    window_size = block_max;
+  }
+
+  void* lzx = lzx_create_block_decompressor(window_size, block_max);
+  if (!lzx) {
+    XELOGE("LDICreateDecompression: failed (window={:X} block={:X})",
+           window_size, block_max);
+    return 0x8007000E;  // E_OUTOFMEMORY
+  }
+
+  auto* ctx = new LdiContext();
+  ctx->lzx = lzx;
+  uint32_t handle;
+  {
+    std::lock_guard<std::mutex> lock(ldi_mutex);
+    handle = ldi_next_handle++;
+    ldi_contexts.emplace(handle, ctx);
+  }
+
+  if (pcb_src_buffer_min) {
+    *pcb_src_buffer_min = block_max;
+  }
+  if (ppv_context) {
+    *ppv_context = handle;
+  }
+  XELOGI("LDICreateDecompression(blockMax={:X}, window={:X}) -> handle {:X}",
+         block_max, window_size, handle);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDICreateDecompression, kMemory, kImplemented);
+
+// int LDIDecompress(void* ctx, void* pbSrc, uint cbSrc, void* pbDst,
+//                   uint* pcbDst);  // pcbDst in:expected out:produced.
+dword_result_t LDIDecompress_entry(dword_t context, lpvoid_t src,
+                                   dword_t src_size, lpvoid_t dst,
+                                   lpdword_t pcb_dst) {
+  LdiContext* ctx = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(ldi_mutex);
+    auto it = ldi_contexts.find(static_cast<uint32_t>(context));
+    if (it != ldi_contexts.end()) {
+      ctx = it->second;
+    }
+  }
+  if (!ctx || !src || !dst || !pcb_dst) {
+    return 0x80070057;  // E_INVALIDARG
+  }
+
+  uint32_t dst_capacity = *pcb_dst;
+  size_t produced = 0;
+  int rc = lzx_decompress_block(ctx->lzx, src, src_size, dst, dst_capacity,
+                                &produced);
+  if (rc != 0) {
+    XELOGW("LDIDecompress: mspack rc={} (cbSrc={:X} dstCap={:X} produced={:X})",
+           rc, static_cast<uint32_t>(src_size), dst_capacity,
+           static_cast<uint32_t>(produced));
+    return 0x80004005;  // E_FAIL
+  }
+  *pcb_dst = static_cast<uint32_t>(produced);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDIDecompress, kMemory, kImplemented);
+
+// int LDIDestroyDecompression(void* ctx);
+dword_result_t LDIDestroyDecompression_entry(dword_t context) {
+  LdiContext* ctx = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(ldi_mutex);
+    auto it = ldi_contexts.find(static_cast<uint32_t>(context));
+    if (it != ldi_contexts.end()) {
+      ctx = it->second;
+      ldi_contexts.erase(it);
+    }
+  }
+  if (ctx) {
+    lzx_free_block_decompressor(ctx->lzx);
+    delete ctx;
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDIDestroyDecompression, kMemory, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

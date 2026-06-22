@@ -11,6 +11,8 @@
 #define XENIA_KERNEL_XAM_XAM_MODULE_H_
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_module.h"
@@ -29,6 +31,11 @@ class XamModule : public KernelModule {
   virtual ~XamModule();
 
   static void RegisterExportTable(xe::cpu::ExportResolver* export_resolver);
+
+  uint32_t GenerateStaticTrampoline(
+      std::string name, cpu::GuestFunction::ExternHandler handler) {
+    return GenerateTrampoline(std::move(name), handler);
+  }
 
   struct LoaderData {
     bool launch_data_present = false;

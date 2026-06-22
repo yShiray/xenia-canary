@@ -8,13 +8,17 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+#include <chrono>
+
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xmutant.h"
 #include "xenia/kernel/xsemaphore.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/kernel/xtimer.h"
 #include "xenia/xbox.h"
 
@@ -537,6 +541,42 @@ DECLARE_XBOXKRNL_EXPORT1(KeInitializeEvent, kThreading, kImplemented);
 
 uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
   auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr);
+  // PROBE (DC3 silhouette): log KeSetEvent on the DC3 NUI camera context events
+  // and whether the event is MODELLED. If the depth callback sets ctx+0x38 but
+  // it's unmodelled, ev is null and the set is a no-op -> nothing wakes.
+  if (event_ptr) {
+    const uint32_t ga = kernel_state()->memory()->HostToGuestVirtual(
+        reinterpret_cast<void*>(event_ptr));
+    if (ga >= 0x8311C8A0u && ga < 0x8311CF00u) {
+      static std::atomic<uint32_t> nset{0};
+      const uint32_t s = nset.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (s <= 24 || (s & (s - 1)) == 0) {
+        // When DC3 itself fires the depth-frame event (ctx+0x38), dump the REAL
+        // frame descriptor it linked at ctx+0xA0 -- esp. the buffer field
+        // (desc+0x64). If that buffer is NOT our registered 0xBDF00000, DC3's
+        // camera frames reference its OWN (empty) buffer -> empty silhouette.
+        auto rd = [&](uint32_t a) -> uint32_t {
+          auto* p = kernel_state()->memory()->TranslateVirtual<uint8_t*>(a);
+          return p ? xe::load_and_swap<uint32_t>(p) : 0xFFFFFFFFu;
+        };
+        const uint32_t descp = rd(0x8311C8A0u + 0xA0u);
+        uint32_t b00 = 0, b58 = 0, b5c = 0, b60 = 0, b64 = 0;
+        if (descp && descp != 0xFFFFFFFFu) {
+          b00 = rd(descp + 0x00u);
+          b58 = rd(descp + 0x58u);
+          b5c = rd(descp + 0x5Cu);
+          b60 = rd(descp + 0x60u);
+          b64 = rd(descp + 0x64u);
+        }
+        XELOGI(
+            "DC3 NUI ctx SETEVENT #{}: obj={:08X} (ctx+0x{:X}) modelled={} "
+            "ctx[A0]=desc={:08X} desc[+00]={:08X} [+58]={:08X} [+5C]={:08X} "
+            "[+60]={:08X} [+64buf]={:08X}",
+            s, ga, ga - 0x8311C8A0u, ev ? 1 : 0, descp, b00, b58, b5c, b60,
+            b64);
+      }
+    }
+  }
   if (!ev) {
     assert_always();
     return 0;
@@ -799,6 +839,44 @@ dword_result_t NtReleaseSemaphore_entry(dword_t sem_handle,
 DECLARE_XBOXKRNL_EXPORT2(NtReleaseSemaphore, kThreading, kImplemented,
                          kHighFrequency);
 
+// In-memory (Ke-prefixed) mutant dispatcher object, initialized directly in
+// guest memory rather than via a handle. JD2019's statically-linked NUI library
+// uses these for its skeleton-processor synchronization; they were declared in
+// the export table but unimplemented, so the title's KeInitializeMutant was a
+// no-op (left the KMUTANT header zeroed) and a later wait/release on it
+// deadlocked the NUI init thread at boot.
+void KeInitializeMutant_entry(pointer_t<X_KMUTANT> mutant_ptr,
+                              dword_t initial_owner) {
+  mutant_ptr.Zero();
+  mutant_ptr->header.type = 2;  // MutantObject
+  mutant_ptr->header.signal_state = initial_owner ? 0u : 1u;
+
+  auto mutant = XObject::GetNativeObject<XMutant>(kernel_state(), mutant_ptr,
+                                                  2 /* MutantObject */);
+  if (!mutant) {
+    assert_always();
+    return;
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeMutant, kThreading, kImplemented);
+
+dword_result_t KeReleaseMutant_entry(pointer_t<X_KMUTANT> mutant_ptr,
+                                     dword_t priority_increment, dword_t abandon,
+                                     dword_t wait) {
+  auto mutant = XObject::GetNativeObject<XMutant>(kernel_state(), mutant_ptr,
+                                                  2 /* MutantObject */);
+  if (!mutant) {
+    assert_always();
+    return 1;
+  }
+  X_STATUS result = mutant->ReleaseMutant(priority_increment, abandon != 0,
+                                          wait != 0);
+  // KeReleaseMutant returns the mutant's previous signal state; callers rarely
+  // inspect it. Report "was owned" (0) on a successful release.
+  return result == X_STATUS_SUCCESS ? 0 : 1;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeReleaseMutant, kThreading, kImplemented);
+
 dword_result_t NtCreateMutant_entry(
     lpdword_t handle_out, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes,
     dword_t initial_owner) {
@@ -949,9 +1027,33 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason,
                                  uint64_t* timeout_ptr) {
   auto object = XObject::GetNativeObject<XObject>(kernel_state(), object_ptr);
 
+  // PROBE (DC3 silhouette): log waits on the DC3 NUI camera context events
+  // (context @0x8311C8A0; the depth callback fires +0x38 / +0x5C0). Tells us
+  // whether a producer/consumer thread actually BLOCKS on these (and whether the
+  // event is modelled) -- if nobody waits, our KeSetEvent goes into the void.
+  if (object_ptr) {
+    const uint32_t ga =
+        kernel_state()->memory()->HostToGuestVirtual(object_ptr);
+    if (ga >= 0x8311C8A0u && ga < 0x8311CF00u) {
+      static std::atomic<uint32_t> nwait{0};
+      const uint32_t w = nwait.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (w <= 24 || (w & (w - 1)) == 0) {
+        XELOGI("DC3 NUI ctx WAIT #{}: obj={:08X} (ctx+0x{:X}) modelled={}", w,
+               ga, ga - 0x8311C8A0u, object ? 1 : 0);
+      }
+    }
+  }
+
   if (!object) {
-    // The only kind-of failure code (though this should never happen)
-    assert_always();
+    // Unmodelled native dispatcher object (e.g. an in-memory timer the title
+    // KeInitialized that we don't track). Release builds skip the assert and
+    // return abandoned, so the title's wait completes and it continues; match
+    // that so debug builds don't crash on titles that wait on such objects
+    // (JD2019's NUI init at boot). Throttled to avoid log spam.
+    static std::atomic<int32_t> warn_budget{8};
+    if (warn_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+      XELOGW("KeWaitForSingleObject on unmodelled native object -> abandoned");
+    }
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
@@ -1029,6 +1131,23 @@ dword_result_t KeWaitForMultipleObjects_entry(
       }
 
       objects[n] = std::move(object_ref);
+    }
+  }
+  // PROBE: which DC3 thread blocks on the NUI camera context events (multi-wait
+  // = the consumer woken by the depth-frame event)? Identify it so we can RE what
+  // it reads from the descriptor/buffer after waking.
+  for (uint32_t n = 0; n < count; n++) {
+    const uint32_t ga = objects_ptr[n];
+    if (ga >= 0x8311C8A0u && ga < 0x8311CF00u) {
+      static std::atomic<uint32_t> nmw{0};
+      const uint32_t w = nmw.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (w <= 16 || (w & (w - 1)) == 0) {
+        XELOGI(
+            "DC3 NUI ctx WAITMULTI #{}: thread={:08X} count={} obj[{}]={:08X} "
+            "(ctx+0x{:X})",
+            w, XThread::GetCurrentThreadId(), uint32_t(count), n, ga,
+            ga - 0x8311C8A0u);
+      }
     }
   }
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
